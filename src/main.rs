@@ -1,49 +1,75 @@
-use evdev::{uinput::VirtualDevice, AttributeSet, KeyCode, KeyEvent, RelativeAxisCode};
-use std::{io, thread, time::{Duration, Instant}};
+mod mouse;
+use mouse::VirtualMouse;
+use ashpd::{
+    desktop::global_shortcuts::{GlobalShortcuts, NewShortcut},
+    register_host_app,
+};
+use evdev::KeyCode;
+use futures_util::StreamExt;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
 
+const APP_ID: &str = "cat.kafka.MyAutoclicker";
 const INTERVAL: Duration = Duration::from_millis(500);
 const HOLD_MILISECONDS: Duration = Duration::from_millis(10);
-const TOTAL_SECONDS: Duration = Duration::from_secs(3);
 
-fn main() -> std::io::Result<()> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Estat compartit entre els dos fils: actiu o no
+    let active = Arc::new(AtomicBool::new(false));
 
-    let mut mouse = create_mouse()?;
+    // 2. Fil del clicker
+    let mut mouse = VirtualMouse::new("my_autoclicker", &[KeyCode::BTN_LEFT, KeyCode::BTN_RIGHT], HOLD_MILISECONDS)?;
 
-    println!("Virtual Mouse created. . Clicking in 3s...");
-    thread::sleep(Duration::from_secs(3));
+    let active_clicker = Arc::clone(&active);
+    thread::spawn(move || {
+        loop {
+            if active_clicker.load(Ordering::Relaxed) {
+                if let Err(e) = mouse.click(KeyCode::BTN_LEFT) {
+                    eprintln!("Error fent clic: {e}");
+                    break;
+                }
+                thread::sleep(INTERVAL);
+            } else {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    });
 
-    let start = Instant::now();
-    let mut count = 0u32;
+    // 3. Ens identifiquem davant del portal
+    register_host_app(APP_ID.try_into()?).await?;
 
-    while start.elapsed() < TOTAL_SECONDS {
-        click(&mut mouse)?;
-        thread::sleep(INTERVAL);
-        count += 1;
-        println!("Click!");
+    // 4. Demanem la drecera global
+    let portal = GlobalShortcuts::new().await?;
+    let session = portal.create_session(Default::default()).await?;
+    let shortcut = NewShortcut::new("toggle", "Activa / atura l'autoclicker")
+        .preferred_trigger("F8");
+    let bound = portal
+        .bind_shortcuts(&session, &[shortcut], None, Default::default())
+        .await?
+        .response()?;
+
+    for s in bound.shortcuts() {
+        println!("Drecera '{}' assignada a: {}", s.id(), s.trigger_description());
     }
 
-    println!("Done: {count} clicks in {:.2?}", start.elapsed());
+    // 5. Escoltem quan es prem la drecera
+    let mut activated = portal.receive_activated().await?;
+    println!("Llest! Prem la drecera per activar/aturar. Ctrl+C per sortir.");
+
+    while let Some(event) = activated.next().await {
+        if event.shortcut_id() == "toggle" {
+            // fetch_xor(true) inverteix el valor i retorna l'anterior
+            let was_active = active.fetch_xor(true, Ordering::Relaxed);
+            println!("{}", if was_active { "Aturat" } else { "Actiu" });
+        }
+    }
+
     Ok(())
-
-}
-
-fn create_mouse() -> io::Result<VirtualDevice> {
-    let mut buttons = AttributeSet::<KeyCode>::new();
-    buttons.insert(KeyCode::BTN_LEFT);
-
-    let mut axes = AttributeSet::<RelativeAxisCode>::new();
-    axes.insert(RelativeAxisCode::REL_X);
-    axes.insert(RelativeAxisCode::REL_Y);
-
-    VirtualDevice::builder()?
-        .name("my_autoclicker")
-        .with_keys(&buttons)?
-        .with_relative_axes(&axes)?
-        .build()
-}
-
-fn click(mouse: &mut VirtualDevice) -> io::Result<()> {
-    mouse.emit(&[*KeyEvent::new(KeyCode::BTN_LEFT, 1)])?;
-    thread::sleep(HOLD_MILISECONDS);
-    mouse.emit(&[*KeyEvent::new(KeyCode::BTN_LEFT, 0)])
 }
